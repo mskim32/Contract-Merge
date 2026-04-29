@@ -1,3 +1,4 @@
+import "@/lib/install-dommatrix-polyfill";
 import { NextResponse } from "next/server";
 import { getGeminiClient } from "@/lib/gemini-client";
 import { loadGeneralConditionsText } from "@/lib/general-conditions-loader";
@@ -28,7 +29,7 @@ export async function POST(req: Request) {
 
     if (!loaded.usedFallback) {
       console.log(
-        `[REVIEW-GENERAL] 로드 완료: PDF ${loaded.pdfFileNames.length}개, txt/md ${loaded.textFileNames.length}개, 비공백 약 ${loaded.meaningfulCharCount.toLocaleString()}자, 경로 ${loaded.resolvedDir}`
+        `[REVIEW-GENERAL] 로드 완료: Markdown ${loaded.markdownFileNames.length}개, 비공백 약 ${loaded.meaningfulCharCount.toLocaleString()}자, 경로 ${loaded.resolvedDir}`
       );
     } else {
       console.warn(
@@ -134,7 +135,8 @@ ${JSON.stringify(payloadItems, null, 2)}
         usedFallback: loaded.usedFallback,
         resolvedDir: loaded.resolvedDir,
         pdfFiles: loaded.pdfFileNames,
-        textFiles: loaded.textFileNames,
+        markdownFiles: loaded.markdownFileNames,
+        textFiles: loaded.markdownFileNames,
         meaningfulCharCount: loaded.meaningfulCharCount,
         warningCount: loaded.warnings.length,
       },

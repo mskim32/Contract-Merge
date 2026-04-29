@@ -1,6 +1,5 @@
 import fs from "fs/promises";
 import path from "path";
-import { PDFParse } from "pdf-parse";
 
 export type GeneralConditionsLoadResult = {
   text: string;
@@ -8,8 +7,10 @@ export type GeneralConditionsLoadResult = {
   /** 추출 본문 전체의 비공백 문자 수(참조 데이터가 실제로 있는지 판단) */
   meaningfulCharCount: number;
   resolvedDir: string;
+  /** PDF 로드는 사용하지 않음(서버 환경 호환). 항상 빈 배열. */
   pdfFileNames: string[];
-  textFileNames: string[];
+  /** 로드에 사용한 `.md` / `.markdown` 파일명 */
+  markdownFileNames: string[];
   warnings: string[];
 };
 
@@ -34,38 +35,9 @@ function markdownToComparableText(markdown: string): string {
     .trim();
 }
 
-function isPdfMagic(buf: Buffer): boolean {
-  if (buf.length < 5) return false;
-  return buf.subarray(0, 5).toString("ascii").startsWith("%PDF");
-}
-
-/**
- * pdf-parse@2: Node에서 Uint8Array 복사 + 폰트 옵션으로 추출 안정화
- */
-export async function extractPdfTextRobust(buffer: Buffer): Promise<string> {
-  const data = new Uint8Array(buffer.byteLength);
-  data.set(buffer);
-  const parser = new PDFParse({
-    data,
-    useSystemFonts: true,
-    disableFontFace: true,
-  });
-  try {
-    const result = await parser.getText();
-    let t = result.text ?? "";
-    if (!t.trim()) {
-      const p2 = new PDFParse({ data: new Uint8Array(buffer) });
-      try {
-        const r2 = await p2.getText();
-        t = r2.text ?? "";
-      } finally {
-        await p2.destroy?.();
-      }
-    }
-    return t;
-  } finally {
-    await parser.destroy?.();
-  }
+function isMarkdownFileName(file: string): boolean {
+  const l = file.toLowerCase();
+  return l.endsWith(".md") || l.endsWith(".markdown");
 }
 
 const FALLBACK_MESSAGE =
@@ -75,7 +47,8 @@ const MAX_GENERAL_CHARS = 300_000;
 
 /**
  * `reference-data/general-conditions` (또는 `GENERAL_CONDITIONS_DIR`)에서
- * PDF 텍스트 + 선택적 .txt / .md 를 읽어 프롬프트용 본문을 만듭니다.
+ * **Markdown(.md / .markdown)만** 읽어 프롬프트용 본문을 만듭니다.
+ * PDF는 Node 서버(pdfjs DOMMatrix 등) 이슈를 피하기 위해 로드하지 않습니다.
  */
 export async function loadGeneralConditionsText(): Promise<GeneralConditionsLoadResult> {
   const warnings: string[] = [];
@@ -84,8 +57,7 @@ export async function loadGeneralConditionsText(): Promise<GeneralConditionsLoad
     : path.join(process.cwd(), "reference-data", "general-conditions");
 
   const sections: string[] = [];
-  const pdfFileNames: string[] = [];
-  const textFileNames: string[] = [];
+  const markdownFileNames: string[] = [];
   let bodyCharTotal = 0;
 
   try {
@@ -101,7 +73,7 @@ export async function loadGeneralConditionsText(): Promise<GeneralConditionsLoad
       meaningfulCharCount: 0,
       resolvedDir,
       pdfFileNames: [],
-      textFileNames: [],
+      markdownFileNames: [],
       warnings,
     };
   }
@@ -109,77 +81,38 @@ export async function loadGeneralConditionsText(): Promise<GeneralConditionsLoad
   const entries = await fs.readdir(resolvedDir);
   const visible = entries.filter((f) => !f.startsWith("~$") && f !== ".gitkeep");
 
-  const pdfs = visible
-    .filter((f) => f.toLowerCase().endsWith(".pdf"))
-    .sort((a, b) => a.localeCompare(b));
-  const textFiles = visible
-    .filter((f) => {
-      const l = f.toLowerCase();
-      return l.endsWith(".txt") || l.endsWith(".md") || l.endsWith(".markdown");
-    })
-    .sort((a, b) => a.localeCompare(b));
-
-  console.log(
-    `[general-conditions-loader] dir=${resolvedDir} pdf=${pdfs.length} txt/md=${textFiles.length}`
-  );
-
-  for (const file of pdfs) {
-    const filePath = path.join(resolvedDir, file);
-    try {
-      const dataBuffer = await fs.readFile(filePath);
-      if (dataBuffer.byteLength === 0) {
-        warnings.push(`0바이트 PDF 건너뜀: ${file}`);
-        continue;
-      }
-      if (!isPdfMagic(dataBuffer)) {
-        warnings.push(
-          `PDF 서명이 아님(손상·다른 형식을 .pdf로 둔 경우): ${file}`
-        );
-      }
-      const text = await extractPdfTextRobust(dataBuffer);
-      const meaningful = text.replace(/\s/g, "").length;
-      bodyCharTotal += meaningful;
-      if (meaningful === 0) {
-        warnings.push(
-          `텍스트 0자(스캔/이미지 PDF 가능): ${file} (${(dataBuffer.byteLength / 1024).toFixed(1)}KB)`
-        );
-      } else {
-        console.log(
-          `[general-conditions-loader] PDF OK "${file}" → 비공백 약 ${meaningful.toLocaleString()}자`
-        );
-      }
-      pdfFileNames.push(file);
-      sections.push(`--- [${file}] ---\n${text}`);
-    } catch (err) {
-      warnings.push(
-        `PDF 읽기/파싱 실패: ${file} — ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
+  const ignoredPdfs = visible.filter((f) => f.toLowerCase().endsWith(".pdf"));
+  if (ignoredPdfs.length > 0) {
+    warnings.push(
+      `PDF ${ignoredPdfs.length}개는 로드하지 않습니다. 내용을 Markdown(.md)으로 두세요. (${ignoredPdfs.join(", ")})`
+    );
   }
 
-  for (const file of textFiles) {
+  const mdFiles = visible.filter(isMarkdownFileName).sort((a, b) => a.localeCompare(b));
+
+  console.log(
+    `[general-conditions-loader] dir=${resolvedDir} markdown=${mdFiles.length} (pdf ignored=${ignoredPdfs.length})`
+  );
+
+  for (const file of mdFiles) {
     const filePath = path.join(resolvedDir, file);
     try {
-      const text = await fs.readFile(filePath, "utf-8");
-      const isMarkdown =
-        file.toLowerCase().endsWith(".md") || file.toLowerCase().endsWith(".markdown");
-      const normalized = isMarkdown
-        ? markdownToComparableText(text)
-        : normalizeTextContent(text);
+      const raw = await fs.readFile(filePath, "utf-8");
+      const normalized = markdownToComparableText(raw);
       const meaningful = normalized.replace(/\s/g, "").length;
       if (meaningful === 0) {
-        warnings.push(`빈 텍스트 파일: ${file}`);
+        warnings.push(`빈 Markdown 파일: ${file}`);
         continue;
       }
       bodyCharTotal += meaningful;
-      textFileNames.push(file);
+      markdownFileNames.push(file);
       sections.push(`--- [${file}] ---\n${normalized}`);
       console.log(
-        `[general-conditions-loader] ${isMarkdown ? "markdown" : "text"} OK "${file}" → 비공백 약 ${meaningful.toLocaleString()}자`
+        `[general-conditions-loader] markdown OK "${file}" → 비공백 약 ${meaningful.toLocaleString()}자`
       );
     } catch (err) {
       warnings.push(
-        `텍스트 파일 읽기 실패: ${file} — ${err instanceof Error ? err.message : String(err)}`
+        `Markdown 읽기 실패: ${file} — ${err instanceof Error ? err.message : String(err)}`
       );
     }
   }
@@ -189,12 +122,16 @@ export async function loadGeneralConditionsText(): Promise<GeneralConditionsLoad
   let text: string;
   if (usedFallback) {
     text = FALLBACK_MESSAGE;
-    if (pdfs.length + textFiles.length > 0) {
+    if (mdFiles.length > 0) {
       warnings.push(
-        "파일은 있으나 본문이 비어 대체만 사용합니다. 스캔 PDF는 OCR 후 .txt로 두거나 본문만 .txt에 저장하세요."
+        "Markdown 파일은 있으나 본문이 비어 대체만 사용합니다. 파일 내용을 확인해 주세요."
+      );
+    } else if (ignoredPdfs.length > 0) {
+      warnings.push(
+        "폴더에 PDF만 있습니다. 일반조건 본문은 .md/.markdown 파일로 추가해 주세요."
       );
     } else {
-      warnings.push("일반조건 폴더에 .pdf / .txt / .md 가 없습니다.");
+      warnings.push("일반조건 폴더에 .md / .markdown 파일이 없습니다.");
     }
   } else {
     text = sections.join("\n\n");
@@ -216,8 +153,8 @@ export async function loadGeneralConditionsText(): Promise<GeneralConditionsLoad
     usedFallback,
     meaningfulCharCount: usedFallback ? 0 : bodyCharTotal,
     resolvedDir,
-    pdfFileNames,
-    textFileNames,
+    pdfFileNames: [],
+    markdownFileNames,
     warnings,
   };
 }
