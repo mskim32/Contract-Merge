@@ -27,6 +27,23 @@ type GroupedData = {
   variations: DuplicateVariation[];
 };
 
+/** 3단계 테이블용: 1단계 추출 행을 중복 그룹과 동일한 형태로 맞춤 */
+function extractedRowToGrouped(r: ExtractedData): GroupedData {
+  return {
+    trade: (r.trade && r.trade.trim()) || "—",
+    majorCategory: (r.majorCategory && r.majorCategory.trim()) || "—",
+    middleCategory: (r.middleCategory && r.middleCategory.trim()) || "-",
+    minorCategory: (r.minorCategory && r.minorCategory.trim()) || "-",
+    count: 1,
+    variations: [
+      {
+        sourceFile: (r.sourceFile && r.sourceFile.trim()) || "-",
+        content: r.content || "",
+      },
+    ],
+  };
+}
+
 type GeneralConditionReview = {
   itemIndex: number;
   content: string;
@@ -588,16 +605,16 @@ export default function CheckMatePage() {
     }
   };
 
-  // Phase 3 Deep Review Function
-  const processDeepReview = async (duplicatesOverride?: GroupedData[]) => {
-    const targetDuplicates = duplicatesOverride ?? duplicatesResults;
+  // Phase 3 Deep Review Function — 전체 추출(results) 각 행에 대해 표준·법률 진단
+  const processDeepReview = async () => {
     if (isDeepReviewing) {
       stage34AbortRef.current?.abort();
       return;
     }
 
-    if (!targetDuplicates || targetDuplicates.length === 0) {
-      alert("먼저 2단계(분류화) 작업을 완료해주세요.");
+    const snapshot = resultsRef.current;
+    if (!snapshot || snapshot.length === 0) {
+      alert("먼저 1단계에서 계약조건을 추출해 주세요.");
       return;
     }
 
@@ -610,15 +627,18 @@ export default function CheckMatePage() {
       setIsDeepReviewing(true);
       setActiveTab('deep_review');
 
-      // Prepare items. Only need to send 1 representative content per group or send all variations?
-      // Since variations have identical meaning, sending the first variation of each group saves tokens.
-      const itemsToReview = targetDuplicates.map((g, idx) => ({
+      setGeneralReviews({});
+      setLegalReviews({});
+      setInitialLegalReviews({});
+      setAppliedSuggestedFixMap({});
+
+      const itemsToReview = snapshot.map((r, idx) => ({
         index: idx.toString(),
-        content: g.variations[0].content, // Send representative content
+        content: r.content || "",
       }));
       setDeepSelectedMap(() => {
         const next: Record<string, boolean> = {};
-        targetDuplicates.forEach((_, idx) => {
+        snapshot.forEach((_, idx) => {
           next[idx.toString()] = true;
         });
         return next;
@@ -785,7 +805,7 @@ export default function CheckMatePage() {
       }
 
       setProgressStatus("원클릭 분석: 3단계 시작");
-      await processDeepReview(step2Results);
+      await processDeepReview();
       await waitUntil(() => !isDeepReviewingRef.current, 1000 * 60 * 10);
       setProgressStatus("원클릭 분석 완료");
     } catch (error: any) {
@@ -915,27 +935,49 @@ export default function CheckMatePage() {
   }, [results, filterTrade, filterMajor]);
 
   const deepReviewRows = useMemo(() => {
-    return duplicatesResults
-      .map((row, index) => {
-        const idxStr = index.toString();
-        const gReview = generalReviews[idxStr];
-        const lReview = legalReviews[idxStr];
-        return { row, index, idxStr, gReview, lReview };
-      })
-      .filter(({ gReview, lReview }) => {
-        const riskOk =
-          deepRiskFilter === "all" ||
-          (deepRiskFilter === "red" && !!lReview && lReview.riskLevel.includes("위반")) ||
-          (deepRiskFilter === "yellow" && !!lReview && lReview.riskLevel.includes("주의")) ||
-          (deepRiskFilter === "green" && !!lReview && lReview.riskLevel.includes("적법"));
+    if (!results?.length) return [];
+    const out: {
+      row: GroupedData;
+      index: number;
+      idxStr: string;
+      gReview?: GeneralConditionReview;
+      lReview?: LegalRiskReview;
+    }[] = [];
+    results.forEach((r, origIdx) => {
+      if (filterTrade !== "All" && r.trade !== filterTrade) return;
+      if (filterMajor !== "All" && r.majorCategory !== filterMajor) return;
+      const idxStr = String(origIdx);
+      const gReview = generalReviews[idxStr];
+      const lReview = legalReviews[idxStr];
+      const riskOk =
+        deepRiskFilter === "all" ||
+        (deepRiskFilter === "red" && !!lReview && lReview.riskLevel.includes("위반")) ||
+        (deepRiskFilter === "yellow" && !!lReview && lReview.riskLevel.includes("주의")) ||
+        (deepRiskFilter === "green" && !!lReview && lReview.riskLevel.includes("적법"));
 
-        const generalOk =
-          deepGeneralFilter === "all" ||
-          (!!gReview && gReview.matchType === deepGeneralFilter);
+      const generalOk =
+        deepGeneralFilter === "all" ||
+        (!!gReview && gReview.matchType === deepGeneralFilter);
 
-        return riskOk && generalOk;
+      if (!riskOk || !generalOk) return;
+      out.push({
+        row: extractedRowToGrouped(r),
+        index: origIdx,
+        idxStr,
+        gReview,
+        lReview,
       });
-  }, [duplicatesResults, generalReviews, legalReviews, deepRiskFilter, deepGeneralFilter]);
+    });
+    return out;
+  }, [
+    results,
+    filterTrade,
+    filterMajor,
+    generalReviews,
+    legalReviews,
+    deepRiskFilter,
+    deepGeneralFilter,
+  ]);
 
   const selectedDeepReviewRows = useMemo(
     () => deepReviewRows.filter(({ idxStr }) => !!deepSelectedMap[idxStr]),
@@ -1409,7 +1451,10 @@ export default function CheckMatePage() {
                 </div>
               </div>
 
-              {activeTab === 'deep_review' && (Object.keys(generalReviews).length > 0 || Object.keys(legalReviews).length > 0) && (
+              {activeTab === 'deep_review' &&
+                results &&
+                results.length > 0 &&
+                (Object.keys(generalReviews).length > 0 || Object.keys(legalReviews).length > 0) && (
                 <div className="px-6 py-3 border-b border-slate-200 bg-white flex items-center gap-2 flex-wrap">
                   <span className="text-xs font-semibold text-slate-500 mr-1">법률 리스크 필터</span>
                   <button onClick={() => setDeepRiskFilter("all")} className={`px-2.5 py-1 text-xs rounded-full border ${deepRiskFilter === "all" ? "bg-slate-800 text-white border-slate-800" : "bg-white text-slate-600 border-slate-300"}`}>전체</button>
@@ -1578,13 +1623,21 @@ export default function CheckMatePage() {
                         </tr>
                       )
                     ) : (
-                      // === DEEP REVIEW TAB ===
-                      duplicatesResults.length > 0 && (Object.keys(generalReviews).length > 0 || Object.keys(legalReviews).length > 0) ? (
+                      <>
+                      {/* === DEEP REVIEW TAB === (1단계 전체 추출 행 기준) */}
+                      {!results?.length ? (
+                        <tr>
+                          <td colSpan={7} className="px-6 py-16 text-center text-slate-500">
+                            1단계에서 추출된 조건이 없습니다. 먼저 문서를 분석해 주세요.
+                          </td>
+                        </tr>
+                      ) : (Object.keys(generalReviews).length > 0 ||
+                        Object.keys(legalReviews).length > 0) ? (
                         deepReviewRows.length > 0 ? (
                           deepReviewRows.map(({ row, index, idxStr, gReview, lReview }) => {
 
                           return (
-                            <tr key={index} className="hover:bg-purple-50/20 transition-colors">
+                            <tr key={`deep-${idxStr}`} className="hover:bg-purple-50/20 transition-colors">
                               <td className="px-4 py-4 text-center align-top">
                                 <input
                                   type="checkbox"
@@ -1749,10 +1802,11 @@ export default function CheckMatePage() {
                               </div>
                               <h3 className="text-lg font-bold text-slate-800 mb-2">3단계 심층 분석 및 법적 리스크 진단</h3>
                               <p className="text-slate-500 text-sm mb-8 leading-relaxed">
-                                AI가 추출된 현장별 주요 계약조건을 공종별 표준/일반조건과 대조하고, 하도급법 및 기본법령을 기반으로 법적 위반 리스크를 점검합니다.
+                                1단계에서 추출된 <span className="font-semibold text-slate-700">전체 계약조건</span> 각 행에 대해 표준/일반조건 대조와 법률 리스크 진단을 수행합니다. 상단 공종·대분류 필터와 진단 필터로 목록을 좁힌 뒤, 체크한 항목만 CSV/엑셀로 보낼 수 있습니다.
                               </p>
                               <button
                                 onClick={() => { void processDeepReview(); }}
+                                disabled={!results?.length}
                                 className={`flex items-center gap-2 px-8 py-3 font-semibold text-white rounded-xl disabled:opacity-70 disabled:cursor-not-allowed shadow-md transition-all hover:-translate-y-0.5 ${
                                   isDeepReviewing
                                     ? "bg-red-600 hover:bg-red-700 shadow-red-600/20"
@@ -1766,6 +1820,8 @@ export default function CheckMatePage() {
                           </td>
                         </tr>
                       )
+                    }
+                    </>
                     )}
                   </tbody>
                 </table>
